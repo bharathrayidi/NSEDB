@@ -62,97 +62,153 @@ def migrate_schema(db_path):
         
         for table, schema in tables.items():
             cursor.execute(f"CREATE TABLE IF NOT EXISTS {table} ({schema})")
-            
-        # Check columns for nifty_predictions
+        
+        # --- MIGRATION 1: nifty_predictions ---
         cursor.execute("PRAGMA table_info(nifty_predictions)")
         existing_cols = {info[1] for info in cursor.fetchall()}
-        
         new_cols = {
             'actual_close': 'REAL', 'outcome': 'TEXT',
             'failure_reason': 'TEXT', 'updated_by': 'TEXT'
         }
-        
         for col, dtype in new_cols.items():
             if col not in existing_cols:
-                print(f"⚙️ Migrating Schema: Adding '{col}' column...")
+                print(f"⚙️ Migrating nifty_predictions: Adding '{col}'...")
                 cursor.execute(f"ALTER TABLE nifty_predictions ADD COLUMN {col} {dtype}")
+
+        # --- MIGRATION 2: nifty_daily_forecast (NEW) ---
+        cursor.execute("PRAGMA table_info(nifty_daily_forecast)")
+        daily_cols = {info[1] for info in cursor.fetchall()}
+        
+        # We add columns to track actual OHLC and the outcome
+        new_daily_cols = {
+            'actual_open': 'REAL', 'actual_high': 'REAL', 'actual_low': 'REAL', 'actual_close': 'REAL',
+            'outcome': 'TEXT', 'error_pct': 'REAL'
+        }
+        for col, dtype in new_daily_cols.items():
+            if col not in daily_cols:
+                print(f"⚙️ Migrating nifty_daily_forecast: Adding '{col}'...")
+                cursor.execute(f"ALTER TABLE nifty_daily_forecast ADD COLUMN {col} {dtype}")
         
         conn.commit()
 
 # ==========================================
-# 3. OPTIMIZED VALIDATION LOOP
+# 3. VALIDATION FUNCTIONS
 # ==========================================
-def validate_past_predictions(db_path):
-    """Batch validates past predictions to minimize DB calls."""
-    print("\n🕵️ Checking for past predictions to validate...")
+
+def get_market_data_for_validation(conn):
+    """Helper to fetch recent market data (Spot prioritized)."""
+    query = f"""
+        SELECT Date, Open, High, Low, Close, Spot
+        FROM index_derivative 
+        WHERE Symbol = '{SYMBOL}' AND Instrument = 'FUTIDX'
+        ORDER BY Date DESC LIMIT 50
+    """
+    df = pd.read_sql(query, conn)
+    if not df.empty:
+        # Prioritize Spot, fallback to Futures Close
+        df['final_close'] = df['Spot'].fillna(df['Close'])
+        df['match_date'] = pd.to_datetime(df['Date']).dt.normalize()
+        # Drop duplicates, keep first entry per date
+        df = df.drop_duplicates(subset=['match_date'])
+    return df
+
+def validate_main_predictions(conn):
+    """Validates the main 'nifty_predictions' table."""
+    print("\n🕵️ Validating 'nifty_predictions' table...")
     
+    # 1. Get Pending
+    pending = pd.read_sql("SELECT id, prediction_date, predicted_price FROM nifty_predictions WHERE actual_close IS NULL", conn)
+    if pending.empty:
+        print("   > No pending rows.")
+        return
+
+    # 2. Get Actuals
+    actuals = get_market_data_for_validation(conn)
+    if actuals.empty: return
+
+    # 3. Match
+    pending['match_date'] = pd.to_datetime(pending['prediction_date']).dt.normalize()
+    merged = pd.merge(pending, actuals, on='match_date', how='inner')
+
+    if merged.empty:
+        print("   > No matching dates found yet.")
+        return
+
+    # 4. Calc Logic
+    merged['error_pct'] = (abs(merged['final_close'] - merged['predicted_price']) / merged['final_close']) * 100
+    conditions = [(merged['error_pct'] < 0.5), (merged['error_pct'] < 1.5)]
+    merged['outcome'] = np.select(conditions, ['PERFECT', 'SUCCESS'], default='FAILED')
+    merged['failure_reason'] = np.select(conditions, ['High Accuracy', 'Acceptable Variance'], default=merged['error_pct'].apply(lambda x: f"High Deviation ({x:.2f}%)"))
+
+    # 5. Update
+    print(f"   📝 Updating {len(merged)} rows in nifty_predictions...")
+    update_data = []
+    for _, row in merged.iterrows():
+        update_data.append((row['final_close'], row['outcome'], row['failure_reason'], 'Validator_Bot', row['id']))
+    
+    cursor = conn.cursor()
+    cursor.executemany("UPDATE nifty_predictions SET actual_close=?, outcome=?, failure_reason=?, updated_by=? WHERE id=?", update_data)
+    conn.commit()
+
+def validate_daily_forecast(conn):
+    """Validates the 'nifty_daily_forecast' table (OHLC predictions)."""
+    print("\n🕵️ Validating 'nifty_daily_forecast' table...")
+
+    # 1. Get Pending
+    pending = pd.read_sql("SELECT id, target_date, pred_close FROM nifty_daily_forecast WHERE actual_close IS NULL", conn)
+    if pending.empty:
+        print("   > No pending rows.")
+        return
+
+    # 2. Get Actuals
+    actuals = get_market_data_for_validation(conn)
+    if actuals.empty: return
+
+    # 3. Match
+    pending['match_date'] = pd.to_datetime(pending['target_date']).dt.normalize()
+    merged = pd.merge(pending, actuals, on='match_date', how='inner')
+
+    if merged.empty:
+        print("   > No matching dates found yet.")
+        return
+
+    # 4. Calc Logic
+    merged['error_pct'] = (abs(merged['final_close'] - merged['pred_close']) / merged['final_close']) * 100
+    
+    # logic: if error < 1% it's a HIT
+    merged['outcome'] = np.where(merged['error_pct'] < 1.0, 'HIT', 'MISS')
+
+    # 5. Update
+    print(f"   📝 Updating {len(merged)} rows in nifty_daily_forecast...")
+    update_data = []
+    for _, row in merged.iterrows():
+        # Order: actual_open, actual_high, actual_low, actual_close, outcome, error_pct, id
+        # Note: 'final_close' is Spot. Open/High/Low are from Futures (closest proxy if Spot OHL not avail)
+        # Ideally we want Spot OHLC, but for now we use what we have (Futures OHLC, Spot Close)
+        update_data.append((
+            row['Open'], row['High'], row['Low'], row['final_close'], 
+            row['outcome'], row['error_pct'], row['id']
+        ))
+
+    cursor = conn.cursor()
+    cursor.executemany("""
+        UPDATE nifty_daily_forecast 
+        SET actual_open=?, actual_high=?, actual_low=?, actual_close=?, outcome=?, error_pct=? 
+        WHERE id=?
+    """, update_data)
+    conn.commit()
+    print(f"   ✅ Successfully validated {len(merged)} daily forecasts.")
+
+def run_all_validations(db_path):
     with get_db_connection() as conn:
-        # Fetch pending predictions
-        pending_query = """
-            SELECT id, prediction_date, predicted_price 
-            FROM nifty_predictions 
-            WHERE actual_close IS NULL
-        """
-        pending = pd.read_sql(pending_query, conn)
-        
-        if pending.empty:
-            print("   > All past predictions are already validated.")
-            return
-
-        # Fetch relevant actuals in one go
-        min_date = pending['prediction_date'].min()
-        actuals_query = f"""
-            SELECT Date, Close as actual_close
-            FROM index_derivative 
-            WHERE Symbol = '{SYMBOL}' AND Instrument = 'FUTIDX' 
-            AND Date >= '{min_date}'
-        """
-        actuals = pd.read_sql(actuals_query, conn)
-        
-        # Merge data (Vectorized operation)
-        merged = pd.merge(pending, actuals, left_on='prediction_date', right_on='Date', how='inner')
-        
-        if merged.empty:
-            print("   > No new actual data available for validation.")
-            return
-
-        # Calculate metrics vectorially
-        merged['error_pct'] = (abs(merged['actual_close'] - merged['predicted_price']) / merged['actual_close']) * 100
-        
-        conditions = [
-            (merged['error_pct'] < 0.5),
-            (merged['error_pct'] < 1.5)
-        ]
-        choices_outcome = ['PERFECT', 'SUCCESS']
-        choices_reason = ['High Accuracy', 'Acceptable Variance']
-        
-        merged['outcome'] = np.select(conditions, choices_outcome, default='FAILED')
-        merged['failure_reason'] = np.select(
-            conditions, 
-            choices_reason, 
-            default=merged['error_pct'].apply(lambda x: f"High Deviation ({x:.2f}%)")
-        )
-        
-        # Bulk Update
-        cursor = conn.cursor()
-        update_data = merged[['actual_close', 'outcome', 'failure_reason', 'id']].to_records(index=False).tolist()
-        # Add 'Validator_Bot' to each record
-        update_data = [ (*x, 'Validator_Bot') for x in update_data ]
-        
-        cursor.executemany('''
-            UPDATE nifty_predictions 
-            SET actual_close = ?, outcome = ?, failure_reason = ?, updated_by = ?
-            WHERE id = ?
-        ''', update_data)
-        
-        conn.commit()
-        print(f"   ✅ Batch validated {len(merged)} predictions.")
+        validate_main_predictions(conn)
+        validate_daily_forecast(conn)
 
 # ==========================================
 # 4. DATA LOADING
 # ==========================================
 def load_futures_data(db_path, symbol):
-    print(f"📂 Loading Historical Futures Data for {symbol}...")
+    print(f"\n📂 Loading Historical Futures Data for {symbol}...")
     if not os.path.exists(db_path):
         print(f"❌ Error: Database not found.")
         return None
@@ -192,7 +248,6 @@ def load_futures_data(db_path, symbol):
 # ==========================================
 def analyze_recent_performance(db_path):
     with get_db_connection() as conn:
-        # Check table existence efficiently
         table_exists = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='nifty_forecast_3month'"
         ).fetchone()
@@ -224,12 +279,9 @@ def get_smart_money_levels(df):
     data = df.tail(30).reset_index(drop=True)
     curr_price = data['Effective_Close'].iloc[-1]
     
-    # Vectorized check for swing points (faster than loop)
     highs = data['High'].values
     lows = data['Low'].values
     
-    # Simple local extrema check (window 5)
-    # Using scipy argrelextrema would be better, but keeping simple logic:
     resistances = []
     supports = []
     
@@ -255,11 +307,9 @@ def predict_next_day_lstm(df):
     
     if len(scaled_full) <= LOOKBACK: return df['Effective_Close'].iloc[-1]
 
-    # Batch creation
     X_train = []
     y_train = []
     
-    # Optimize loop: Pre-allocate numpy arrays if possible, but list append is okay for small N
     for i in range(LOOKBACK, len(scaled_full)):
         X_train.append(scaled_full[i-LOOKBACK:i])
         y_train.append(scaled_full[i, 3]) # Target: Effective_Close
@@ -312,9 +362,12 @@ def calculate_ohlc_prediction(current_close, lstm_close, sup_res_data, atr, adj_
 def save_daily_prediction(db_path, data, learning_note):
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        
+        # Insert into nifty_daily_forecast (The OHLC table)
         cursor.execute("INSERT INTO nifty_daily_forecast (target_date, pred_open, pred_high, pred_low, pred_close, trend) VALUES (?, ?, ?, ?, ?, ?)", 
                        (data['date'], data['o'], data['h'], data['l'], data['c'], data['trend']))
         
+        # Insert into nifty_predictions (The Main detailed table)
         cursor.execute("""
             INSERT INTO nifty_predictions (
                 prediction_date, data_upto_date, run_time, current_price, predicted_price, 
@@ -326,14 +379,15 @@ def save_daily_prediction(db_path, data, learning_note):
             data['h'], data['l'], f"Range: {data['l']:,.0f}-{data['h']:,.0f} | Note: {learning_note}", 'Deep_LSTM_Adaptive'
         ))
         conn.commit()
-    print("✅ Saved Forecast to DB.")
+    print("✅ Saved Forecast to DB (Both Tables).")
 
 # ==========================================
 # 7. MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
     migrate_schema(DB_PATH)
-    validate_past_predictions(DB_PATH)
+    run_all_validations(DB_PATH) # <-- Validates both tables now
+    
     df = load_futures_data(DB_PATH, SYMBOL)
     
     if df is not None and len(df) > LOOKBACK:
@@ -349,6 +403,7 @@ if __name__ == "__main__":
         print(f"   > Adjusted Target ({bias_type}): {ohlc['Close']:.2f}")
         
         target_date = df['Date'].iloc[-1] + timedelta(days=1)
+        # Skip weekends
         while target_date.weekday() >= 5: target_date += timedelta(days=1)
         
         print("\n" + "="*40)
